@@ -1,7 +1,8 @@
-use evdev::{AttributeSet, Device, EventType, RelativeAxisCode, uinput::VirtualDevice};
+use evdev::{AttributeSet, Device, EventType, InputEvent, RelativeAxisCode, uinput::VirtualDevice};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -9,7 +10,7 @@ use std::{
 #[clap(
     name = "mouse-debounce",
     about = "Software mouse button debounce daemon",
-    long_about = "Grabs a mouse device and filters bounce events.\nCLI flags override config file values."
+    long_about = "Grabs a mouse device and filters bounce events using Asymmetric Eager-Defer.\nCLI flags override config file values."
 )]
 struct Cli {
     #[clap(short, long)]
@@ -47,7 +48,7 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("/root"))
                     .join(".config")
             });
-        let candidates = [
+        let candidates =[
             xdg.join("mouse-debounce/config.toml"),
             PathBuf::from("/etc/mouse-debounce/config.toml"),
         ];
@@ -116,8 +117,10 @@ struct ButtonConfig {
 
 #[derive(Clone, Copy)]
 struct ButtonState {
-    last_time: Option<Instant>,
-    last_value: i32,
+    logical_state: bool,
+    physical_state: bool,
+    press_lockout_until: Option<Instant>,
+    release_deadline: Option<Instant>,
 }
 
 fn main() {
@@ -146,7 +149,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("Failed to open {}: {e}", device_path.display()));
 
     println!(
-        "Opened: {} | default debounce: {}ms | mode: {}",
+        "Opened: {} | Eager-Defer Debounce: {}ms | mode: {}",
         device.name().unwrap_or("unknown"),
         default_ms,
         if debounce_all { "all buttons" } else { "selected buttons only" }
@@ -181,13 +184,21 @@ fn main() {
         .expect("Failed to build virtual device");
 
     let table_size = (max_key_code + 1).max(768) as usize;
-    
+
     let mut btn_configs = vec![
-        ButtonConfig { debounce_dur: default_debounce, is_debounced: debounce_all }; 
+        ButtonConfig {
+            debounce_dur: default_debounce,
+            is_debounced: debounce_all,
+        };
         table_size
     ];
     let mut btn_states = vec![
-        ButtonState { last_time: None, last_value: -1 }; 
+        ButtonState {
+            logical_state: false,
+            physical_state: false,
+            press_lockout_until: None,
+            release_deadline: None,
+        };
         table_size
     ];
 
@@ -203,7 +214,7 @@ fn main() {
             }
         }
     }
-    
+
     for &code in &cli.buttons {
         if (code as usize) < table_size {
             btn_configs[code as usize] = ButtonConfig {
@@ -213,48 +224,130 @@ fn main() {
         }
     }
 
-    let mut emit_buffer = Vec::with_capacity(64);
+    let (tx, rx) = mpsc::channel::<Vec<InputEvent>>();
+
+    std::thread::spawn(move || {
+        loop {
+            match device.fetch_events() {
+                Ok(events) => {
+                    let batch: Vec<InputEvent> = events.collect();
+                    if tx.send(batch).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Device read error (disconnected?): {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
-        let events = device.fetch_events().expect("Failed to fetch events");
+        let now = Instant::now();
+        let mut next_deadline: Option<Instant> = None;
 
-        for ev in events {
-            let mut pass = true;
+        for state in btn_states.iter() {
+            if let Some(dl) = state.release_deadline {
+                if let Some(nd) = next_deadline {
+                    if dl < nd {
+                        next_deadline = Some(dl);
+                    }
+                } else {
+                    next_deadline = Some(dl);
+                }
+            }
+        }
 
-            if ev.event_type() == EventType::KEY {
-                let code = ev.code() as usize;
-                let value = ev.value();
+        let timeout = next_deadline.map(|nd| nd.saturating_duration_since(now));
 
-                if code < table_size && btn_configs[code].is_debounced {
-                    let config = &btn_configs[code];
-                    let state = &mut btn_states[code];
+        let received = if let Some(t) = timeout {
+            if t.is_zero() {
+                Err(mpsc::RecvTimeoutError::Timeout)
+            } else {
+                rx.recv_timeout(t)
+            }
+        } else {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
 
-                    let too_soon = state
-                        .last_time
-                        .map(|t| t.elapsed() < config.debounce_dur)
-                        .unwrap_or(false);
+        let now = Instant::now();
+        let mut emit_buffer = Vec::with_capacity(64);
 
-                    if !too_soon && state.last_value != value {
-                        state.last_time = Some(Instant::now());
-                        state.last_value = value;
-                    } else {
-                        if cli.verbose && too_soon {
-                            let elapsed_ms = state.last_time.unwrap().elapsed().as_millis();
-                            eprintln!("Debounced BTN={code} value={value} elapsed={elapsed_ms}ms");
+        match received {
+            Ok(events) => {
+                for ev in events {
+                    if ev.event_type() == EventType::KEY {
+                        let code = ev.code() as usize;
+                        let value = ev.value();
+
+                        if code < table_size && btn_configs[code].is_debounced {
+                            let config = &btn_configs[code];
+                            let state = &mut btn_states[code];
+
+                            state.physical_state = value != 0;
+
+                            if state.physical_state {
+                                state.release_deadline = None;
+
+                                let lockout_over = state
+                                    .press_lockout_until
+                                    .map(|t| now >= t)
+                                    .unwrap_or(true);
+
+                                if !state.logical_state && lockout_over {
+                                    state.logical_state = true;
+                                    state.press_lockout_until = Some(now + config.debounce_dur);
+                                    emit_buffer.push(ev);
+                                } else if cli.verbose && !lockout_over && !state.logical_state {
+                                    eprintln!("Blocked bounce on PRESS BTN={code}");
+                                }
+                            } else if state.logical_state {
+                                state.release_deadline = Some(now + config.debounce_dur);
+                            }
+                        } else {
+                            emit_buffer.push(ev);
                         }
-                        pass = false;
+                    } else {
+                        emit_buffer.push(ev);
                     }
                 }
             }
-
-            if pass {
-                emit_buffer.push(ev);
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("Event reader thread exited. Shutting down.");
+                break;
             }
+        }
+
+        let mut emitted_deferred = false;
+        for (code, state) in btn_states.iter_mut().enumerate() {
+            if let Some(dl) = state.release_deadline {
+                if now >= dl {
+                    if !state.physical_state && state.logical_state {
+                        state.logical_state = false;
+                        emit_buffer.push(InputEvent::new(EventType::KEY.0, code as u16, 0));
+                        emitted_deferred = true;
+
+                        if cli.verbose {
+                            eprintln!("Emitted deferred RELEASE BTN={code}");
+                        }
+                    }
+                    state.release_deadline = None;
+                }
+            }
+        }
+
+        if emitted_deferred {
+            emit_buffer.push(InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                evdev::SynchronizationCode::SYN_REPORT.0,
+                0,
+            ));
         }
 
         if !emit_buffer.is_empty() {
             virt.emit(&emit_buffer).expect("emit failed");
-            emit_buffer.clear();
         }
     }
 }
