@@ -1,0 +1,22 @@
+# mouse-debounce config
+# Place at one of:
+#   ~/.config/mouse-debounce/config.toml  (preferred, user)
+#   /etc/mouse-debounce/config.toml       (system-wide)
+# Or pass explicitly with --config /path/to/config.toml
+
+# Device to grab. Leave unset to auto-detect.
+# device = "/dev/input/by-id/usb-Logitech_G102_LIGHTSYNC_Gaming_Mouse_REPLACE_ME-event-mouse"
+
+# Default debounce time in ms for all buttons
+ms = 50
+
+# Optional: per-button overrides (evdev button codes)
+# 272 = left click
+# 273 = right click
+# 274 = middle click
+# 275 = side button back
+# 276 = side button forward
+[buttons]
+"272" = 50   # left click — worn switch, needs most debounce
+"273" = 20   # right click — less worn
+"274" = 10   # middle

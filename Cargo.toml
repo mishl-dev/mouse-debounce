@@ -1,0 +1,11 @@
+[package]
+name = "mouse-debounce"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.60", features = ["derive"] }
+dirs-next = "2.0.0"
+evdev = "0.13.2"
+serde = { version = "1.0.228" , features = ["derive"] }
+toml = "1.0.6"
