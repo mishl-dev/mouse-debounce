@@ -1,10 +1,7 @@
-use evdev::{
-    uinput::VirtualDevice,
-    AttributeSet, Device, EventType, InputEvent,
-};
+use evdev::{AttributeSet, Device, EventType, InputEvent, RelativeAxisCode, uinput::VirtualDevice};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -73,7 +70,7 @@ impl Config {
         candidates[0].clone()
     }
 
-    fn load(path: &PathBuf) -> Self {
+    fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 eprintln!("Using config: {}", path.display());
@@ -87,19 +84,14 @@ impl Config {
     }
 }
 
-// Scan /dev/input for devices that look like mice (have left click + relative axes).
-// If multiple are found, picks the first. Prints what it found so the user knows.
 fn detect_mouse() -> Option<PathBuf> {
     let by_id = PathBuf::from("/dev/input/by-id");
     if by_id.exists() {
-        // Prefer by-id symlinks — stable across reboots
         if let Ok(entries) = std::fs::read_dir(&by_id) {
             let mut candidates: Vec<PathBuf> = entries
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.to_string_lossy().contains("event-mouse")
-                })
+                .filter(|p| p.to_string_lossy().contains("event-mouse"))
                 .collect();
             candidates.sort();
             if let Some(path) = candidates.first() {
@@ -107,7 +99,6 @@ fn detect_mouse() -> Option<PathBuf> {
             }
         }
     }
-    // Fallback: scan /dev/input/event* and check for BTN_LEFT support
     if let Ok(entries) = std::fs::read_dir("/dev/input") {
         let mut candidates: Vec<PathBuf> = entries
             .flatten()
@@ -118,7 +109,6 @@ fn detect_mouse() -> Option<PathBuf> {
         for path in candidates {
             if let Ok(dev) = Device::open(&path) {
                 if let Some(keys) = dev.supported_keys() {
-                    // BTN_LEFT = 272
                     if keys.contains(evdev::KeyCode::BTN_LEFT) {
                         return Some(path);
                     }
@@ -135,7 +125,8 @@ fn main() {
     let cfg = Config::load(&config_path);
 
     let default_ms = cli.ms.max(cfg.ms.unwrap_or(0)).max(1);
-    let device_path = cli.device
+    let device_path = cli
+        .device
         .or(cfg.device)
         .map(PathBuf::from)
         .or_else(|| {
@@ -156,7 +147,9 @@ fn main() {
         }
     }
     for code in &cli.buttons {
-        button_ms.entry(*code).or_insert(Duration::from_millis(default_ms));
+        button_ms
+            .entry(*code)
+            .or_insert(Duration::from_millis(default_ms));
     }
 
     let debounce_all = cli.buttons.is_empty() && cfg.buttons.is_none();
@@ -169,10 +162,16 @@ fn main() {
         "Opened: {} | default debounce: {}ms | mode: {}",
         device.name().unwrap_or("unknown"),
         default_ms,
-        if debounce_all { "all buttons" } else { "selected buttons only" }
+        if debounce_all {
+            "all buttons"
+        } else {
+            "selected buttons only"
+        }
     );
 
-    device.grab().expect("Failed to grab device — are you root?");
+    device
+        .grab()
+        .expect("Failed to grab device — are you root?");
 
     let mut keys = AttributeSet::<evdev::KeyCode>::new();
     if let Some(supported) = device.supported_keys() {
@@ -181,16 +180,24 @@ fn main() {
         }
     }
 
+    let mut axes = AttributeSet::<RelativeAxisCode>::new();
+    if let Some(supported) = device.supported_relative_axes() {
+        for axis in supported.iter() {
+            axes.insert(axis);
+        }
+    }
+
     let mut virt = VirtualDevice::builder()
         .expect("Failed to create virtual device builder")
         .name("mouse-debounce")
         .with_keys(&keys)
         .expect("Failed to set keys")
+        .with_relative_axes(&axes)
+        .expect("Failed to set axes")
         .build()
         .expect("Failed to build virtual device");
 
-    let mut state: HashMap<u16, (Instant, i32)> = HashMap::new();
-    let epoch = Instant::now() - Duration::from_secs(10);
+    let mut state: HashMap<u16, (Option<Instant>, i32)> = HashMap::new();
 
     loop {
         let events: Vec<InputEvent> = device
@@ -212,18 +219,20 @@ fn main() {
                     continue;
                 };
 
-                let entry = state.entry(code).or_insert((epoch, -1));
-                let elapsed = entry.0.elapsed();
+                let entry = state.entry(code).or_insert((None, -1));
+                let elapsed = entry.0.map(|t| t.elapsed());
                 let last_value = entry.1;
 
-                if elapsed >= debounce && last_value != value {
-                    *entry = (Instant::now(), value);
+                let too_soon = elapsed.map(|e| e < debounce).unwrap_or(false);
+
+                if !too_soon && last_value != value {
+                    *entry = (Some(Instant::now()), value);
                     true
                 } else {
-                    if cli.verbose && elapsed < debounce {
+                    if cli.verbose && too_soon {
                         eprintln!(
                             "Debounced BTN={code} value={value} elapsed={}ms",
-                            elapsed.as_millis()
+                            elapsed.unwrap().as_millis()
                         );
                     }
                     false
