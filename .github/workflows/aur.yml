@@ -6,8 +6,16 @@ on:
       - 'v*'
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+
   aur:
     runs-on: ubuntu-latest
+    needs: check
     steps:
       - uses: actions/checkout@v4
 
@@ -23,3 +31,4 @@ jobs:
           updpkgsums: true
           assets: |
             ./mouse-debounce.install
+            ./mouse-debounce.service

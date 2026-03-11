@@ -9,8 +9,9 @@ license=('MIT')
 depends=('libevdev')
 makedepends=('rust' 'cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
-        "mouse-debounce.install::$url/raw/main/mouse-debounce.install")
-sha256sums=('SKIP' 'SKIP')
+        "mouse-debounce.install::$url/raw/main/mouse-debounce.install"
+        "mouse-debounce.service::$url/raw/main/mouse-debounce.service")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 install=mouse-debounce.install
 
 build() {
