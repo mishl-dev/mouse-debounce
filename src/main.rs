@@ -229,6 +229,12 @@ fn main() {
                     *entry = (Some(Instant::now()), value);
                     true
                 } else {
+                    if too_soon {
+                        // Extend the debounce window from the most recent bounce,
+                        // not from the last accepted event. Without this, a late
+                        // bounce arriving just after the window expires would slip through.
+                        entry.0 = Some(Instant::now());
+                    }
                     if cli.verbose && too_soon {
                         eprintln!(
                             "Debounced BTN={code} value={value} elapsed={}ms",
