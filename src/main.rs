@@ -1,4 +1,4 @@
-use evdev::{AttributeSet, Device, EventType, InputEvent, RelativeAxisCode, uinput::VirtualDevice};
+use evdev::{AttributeSet, Device, EventType, RelativeAxisCode, uinput::VirtualDevice};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -12,24 +12,18 @@ use std::{
     long_about = "Grabs a mouse device and filters bounce events.\nCLI flags override config file values."
 )]
 struct Cli {
-    /// Path to the input device, e.g. /dev/input/by-id/usb-...-event-mouse
     #[clap(short, long)]
     device: Option<String>,
 
-    /// Default debounce time in milliseconds
     #[clap(short, long, default_value_t = 50)]
     ms: u64,
 
-    /// Path to TOML config file (overrides auto-discovery)
     #[clap(short, long)]
     config: Option<PathBuf>,
 
-    /// Only debounce these buttons by evdev code (e.g. 272=left, 273=right, 274=middle).
-    /// If omitted, all buttons are debounced.
     #[clap(short, long, value_delimiter = ',')]
     buttons: Vec<u16>,
 
-    /// Print every debounced event (useful for tuning)
     #[clap(short, long)]
     verbose: bool,
 }
@@ -42,11 +36,6 @@ struct Config {
 }
 
 impl Config {
-    // Search order:
-    // 1. CLI --config flag
-    // 2. $XDG_CONFIG_HOME/mouse-debounce/config.toml
-    // 3. ~/.config/mouse-debounce/config.toml
-    // 4. /etc/mouse-debounce/config.toml
     fn find(explicit: Option<PathBuf>) -> PathBuf {
         if let Some(p) = explicit {
             return p;
@@ -119,6 +108,18 @@ fn detect_mouse() -> Option<PathBuf> {
     None
 }
 
+#[derive(Clone, Copy)]
+struct ButtonConfig {
+    debounce_dur: Duration,
+    is_debounced: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ButtonState {
+    last_time: Option<Instant>,
+    last_value: i32,
+}
+
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
     let config_path = Config::find(cli.config);
@@ -138,20 +139,6 @@ fn main() {
         })
         .expect("No mouse device found. Use --device or set 'device' in config.");
 
-    let mut button_ms: HashMap<u16, Duration> = HashMap::new();
-    if let Some(cfg_buttons) = &cfg.buttons {
-        for (code_str, &ms) in cfg_buttons {
-            if let Ok(code) = code_str.parse::<u16>() {
-                button_ms.insert(code, Duration::from_millis(ms));
-            }
-        }
-    }
-    for code in &cli.buttons {
-        button_ms
-            .entry(*code)
-            .or_insert(Duration::from_millis(default_ms));
-    }
-
     let debounce_all = cli.buttons.is_empty() && cfg.buttons.is_none();
     let default_debounce = Duration::from_millis(default_ms);
 
@@ -162,21 +149,17 @@ fn main() {
         "Opened: {} | default debounce: {}ms | mode: {}",
         device.name().unwrap_or("unknown"),
         default_ms,
-        if debounce_all {
-            "all buttons"
-        } else {
-            "selected buttons only"
-        }
+        if debounce_all { "all buttons" } else { "selected buttons only" }
     );
 
-    device
-        .grab()
-        .expect("Failed to grab device — are you root?");
+    device.grab().expect("Failed to grab device — are you root?");
 
     let mut keys = AttributeSet::<evdev::KeyCode>::new();
+    let mut max_key_code = 0;
     if let Some(supported) = device.supported_keys() {
         for key in supported.iter() {
             keys.insert(key);
+            max_key_code = max_key_code.max(key.code());
         }
     }
 
@@ -197,59 +180,81 @@ fn main() {
         .build()
         .expect("Failed to build virtual device");
 
-    let mut state: HashMap<u16, (Option<Instant>, i32)> = HashMap::new();
+    let table_size = (max_key_code + 1).max(768) as usize;
+    
+    let mut btn_configs = vec![
+        ButtonConfig { debounce_dur: default_debounce, is_debounced: debounce_all }; 
+        table_size
+    ];
+    let mut btn_states = vec![
+        ButtonState { last_time: None, last_value: -1 }; 
+        table_size
+    ];
+
+    if let Some(cfg_buttons) = &cfg.buttons {
+        for (code_str, &ms) in cfg_buttons {
+            if let Ok(code) = code_str.parse::<u16>() {
+                if (code as usize) < table_size {
+                    btn_configs[code as usize] = ButtonConfig {
+                        debounce_dur: Duration::from_millis(ms),
+                        is_debounced: true,
+                    };
+                }
+            }
+        }
+    }
+    
+    for &code in &cli.buttons {
+        if (code as usize) < table_size {
+            btn_configs[code as usize] = ButtonConfig {
+                debounce_dur: default_debounce,
+                is_debounced: true,
+            };
+        }
+    }
+
+    let mut emit_buffer = Vec::with_capacity(64);
 
     loop {
-        let events: Vec<InputEvent> = device
-            .fetch_events()
-            .expect("Failed to fetch events")
-            .collect();
+        let events = device.fetch_events().expect("Failed to fetch events");
 
         for ev in events {
-            let pass = if ev.event_type() == EventType::KEY {
-                let code = ev.code();
+            let mut pass = true;
+
+            if ev.event_type() == EventType::KEY {
+                let code = ev.code() as usize;
                 let value = ev.value();
 
-                let debounce = if debounce_all {
-                    default_debounce
-                } else if let Some(&d) = button_ms.get(&code) {
-                    d
-                } else {
-                    virt.emit(&[ev]).expect("emit failed");
-                    continue;
-                };
+                if code < table_size && btn_configs[code].is_debounced {
+                    let config = &btn_configs[code];
+                    let state = &mut btn_states[code];
 
-                let entry = state.entry(code).or_insert((None, -1));
-                let elapsed = entry.0.map(|t| t.elapsed());
-                let last_value = entry.1;
+                    let too_soon = state
+                        .last_time
+                        .map(|t| t.elapsed() < config.debounce_dur)
+                        .unwrap_or(false);
 
-                let too_soon = elapsed.map(|e| e < debounce).unwrap_or(false);
-
-                if !too_soon && last_value != value {
-                    *entry = (Some(Instant::now()), value);
-                    true
-                } else {
-                    if too_soon {
-                        // Extend the debounce window from the most recent bounce,
-                        // not from the last accepted event. Without this, a late
-                        // bounce arriving just after the window expires would slip through.
-                        entry.0 = Some(Instant::now());
+                    if !too_soon && state.last_value != value {
+                        state.last_time = Some(Instant::now());
+                        state.last_value = value;
+                    } else {
+                        if cli.verbose && too_soon {
+                            let elapsed_ms = state.last_time.unwrap().elapsed().as_millis();
+                            eprintln!("Debounced BTN={code} value={value} elapsed={elapsed_ms}ms");
+                        }
+                        pass = false;
                     }
-                    if cli.verbose && too_soon {
-                        eprintln!(
-                            "Debounced BTN={code} value={value} elapsed={}ms",
-                            elapsed.unwrap().as_millis()
-                        );
-                    }
-                    false
                 }
-            } else {
-                true
-            };
+            }
 
             if pass {
-                virt.emit(&[ev]).expect("emit failed");
+                emit_buffer.push(ev);
             }
+        }
+
+        if !emit_buffer.is_empty() {
+            virt.emit(&emit_buffer).expect("emit failed");
+            emit_buffer.clear();
         }
     }
 }
