@@ -20,4 +20,6 @@ jobs:
           commit_email: meow@mishl.dev
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           commit_message: "Update to ${{ github.ref_name }}"
-          allow_out_of_date_packages: true
+          updpkgsums: true
+          assets: |
+            ./mouse-debounce.install
