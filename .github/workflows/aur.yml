@@ -1,3 +1,8 @@
+name: AUR Release
+on:
+  push:
+    tags:
+      - 'v*'
 jobs:
   check:
     runs-on: ubuntu-latest
