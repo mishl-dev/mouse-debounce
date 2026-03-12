@@ -123,42 +123,30 @@ struct ButtonState {
     release_deadline: Option<Instant>,
 }
 
-fn main() {
-    let cli = <Cli as clap::Parser>::parse();
-    let config_path = Config::find(cli.config);
-    let cfg = Config::load(&config_path);
+struct RunParams<'a> {
+    device_path: &'a Path,
+    debounce_all: bool,
+    default_debounce: Duration,
+    cli_buttons: &'a [u16],
+    cfg_buttons: &'a Option<HashMap<String, u64>>,
+    verbose: bool,
+}
 
-    let default_ms = cli.ms.max(cfg.ms.unwrap_or(0)).max(1);
-    let device_path = cli
-        .device
-        .or(cfg.device)
-        .map(PathBuf::from)
-        .or_else(|| {
-            let found = detect_mouse();
-            if let Some(ref p) = found {
-                eprintln!("Auto-detected mouse: {}", p.display());
-            }
-            found
-        })
-        .expect("No mouse device found. Use --device or set 'device' in config.");
-
-    let debounce_all = cli.buttons.is_empty() && cfg.buttons.is_none();
-    let default_debounce = Duration::from_millis(default_ms);
-
-    let mut device = Device::open(&device_path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", device_path.display()));
+fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
+    let mut device = Device::open(p.device_path)
+        .map_err(|e| format!("Failed to open {}: {e}", p.device_path.display()))?;
 
     println!(
         "Opened: {} | Eager-Defer Debounce: {}ms | mode: {}",
         device.name().unwrap_or("unknown"),
-        default_ms,
-        if debounce_all { "all buttons" } else { "selected buttons only" }
+        p.default_debounce.as_millis(),
+        if p.debounce_all { "all buttons" } else { "selected buttons only" }
     );
 
-    device.grab().expect("Failed to grab device — are you root?");
+    device.grab().map_err(|e| format!("Failed to grab device: {e}"))?;
 
     let mut keys = AttributeSet::<evdev::KeyCode>::new();
-    let mut max_key_code = 0;
+    let mut max_key_code = 0u16;
     if let Some(supported) = device.supported_keys() {
         for key in supported.iter() {
             keys.insert(key);
@@ -174,21 +162,21 @@ fn main() {
     }
 
     let mut virt = VirtualDevice::builder()
-        .expect("Failed to create virtual device builder")
+        .map_err(|e| format!("Failed to create virtual device builder: {e}"))?
         .name("mouse-debounce")
         .with_keys(&keys)
-        .expect("Failed to set keys")
+        .map_err(|e| format!("Failed to set keys: {e}"))?
         .with_relative_axes(&axes)
-        .expect("Failed to set axes")
+        .map_err(|e| format!("Failed to set axes: {e}"))?
         .build()
-        .expect("Failed to build virtual device");
+        .map_err(|e| format!("Failed to build virtual device: {e}"))?;
 
     let table_size = (max_key_code + 1).max(768) as usize;
 
     let mut btn_configs = vec![
         ButtonConfig {
-            debounce_dur: default_debounce,
-            is_debounced: debounce_all,
+            debounce_dur: p.default_debounce,
+            is_debounced: p.debounce_all,
         };
         table_size
     ];
@@ -202,7 +190,7 @@ fn main() {
         table_size
     ];
 
-    if let Some(cfg_buttons) = &cfg.buttons {
+    if let Some(cfg_buttons) = p.cfg_buttons {
         for (code_str, &ms) in cfg_buttons {
             if let Ok(code) = code_str.parse::<u16>() {
                 if (code as usize) < table_size {
@@ -215,10 +203,10 @@ fn main() {
         }
     }
 
-    for &code in &cli.buttons {
+    for &code in p.cli_buttons {
         if (code as usize) < table_size {
             btn_configs[code as usize] = ButtonConfig {
-                debounce_dur: default_debounce,
+                debounce_dur: p.default_debounce,
                 is_debounced: true,
             };
         }
@@ -236,7 +224,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Device read error (disconnected?): {}", e);
+                    eprintln!("Device read error: {e}");
                     break;
                 }
             }
@@ -294,7 +282,7 @@ fn main() {
                                     state.logical_state = true;
                                     state.press_lockout_until = Some(now + config.debounce_dur);
                                     emit_buffer.push(ev);
-                                } else if cli.verbose && !lockout_over && !state.logical_state {
+                                } else if p.verbose && !lockout_over && !state.logical_state {
                                     eprintln!("Blocked bounce on PRESS BTN={code}");
                                 }
                             } else if state.logical_state {
@@ -313,8 +301,7 @@ fn main() {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("Event reader thread exited. Shutting down.");
-                break;
+                return Err("Device disconnected".into());
             }
         }
 
@@ -327,7 +314,7 @@ fn main() {
                         state.logical_state = false;
                         emit_buffer.push(InputEvent::new(EventType::KEY.0, code as u16, 0));
                         emitted_deferred = true;
-                        if cli.verbose {
+                        if p.verbose {
                             eprintln!("Emitted deferred RELEASE BTN={code}");
                         }
                     }
@@ -349,7 +336,53 @@ fn main() {
         }
 
         if !emit_buffer.is_empty() {
-            virt.emit(&emit_buffer).expect("emit failed");
+            virt.emit(&emit_buffer).map_err(|e| format!("emit failed: {e}"))?;
+        }
+    }
+}
+
+fn main() {
+    let cli = <Cli as clap::Parser>::parse();
+    let config_path = Config::find(cli.config);
+    let cfg = Config::load(&config_path);
+
+    let default_ms = cli.ms.max(cfg.ms.unwrap_or(0)).max(1);
+    let debounce_all = cli.buttons.is_empty() && cfg.buttons.is_none();
+    let default_debounce = Duration::from_millis(default_ms);
+    let explicit_device: Option<PathBuf> = cli.device.or(cfg.device).map(PathBuf::from);
+
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    loop {
+        let device_path = match &explicit_device {
+            Some(p) => p.clone(),
+            None => match detect_mouse() {
+                Some(p) => {
+                    eprintln!("Auto-detected mouse: {}", p.display());
+                    p
+                }
+                None => {
+                    eprintln!("No mouse device found, retrying...");
+                    std::thread::sleep(RETRY_DELAY);
+                    continue;
+                }
+            },
+        };
+
+        let params = RunParams {
+            device_path: &device_path,
+            debounce_all,
+            default_debounce,
+            cli_buttons: &cli.buttons,
+            cfg_buttons: &cfg.buttons,
+            verbose: cli.verbose,
+        };
+
+        if let Err(e) = run(&params) {
+            eprintln!("Error: {e}. Retrying...");
+            std::thread::sleep(RETRY_DELAY);
+        } else {
+            break;
         }
     }
 }
