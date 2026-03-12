@@ -8,7 +8,7 @@
 # device = "/dev/input/by-id/usb-Logitech_G102_LIGHTSYNC_Gaming_Mouse_REPLACE_ME-event-mouse"
 
 # Default debounce time in ms for all buttons
-ms = 50
+ms = 30
 
 # Optional: per-button overrides (evdev button codes)
 # 272 = left click

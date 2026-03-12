@@ -3,21 +3,24 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const MIN_EVENT_GAP: Duration = Duration::from_millis(1);
 
 #[derive(clap::Parser, Debug)]
 #[clap(
     name = "mouse-debounce",
     about = "Software mouse button debounce daemon",
-    long_about = "Grabs a mouse device and filters bounce events using Asymmetric Eager-Defer with adaptive EMA thresholds.\nPress events are emitted immediately; release events are deferred until the debounce window expires.\nThe debounce window per button adapts over time by tracking bounce vs. repress interval distributions.\nCLI flags override config file values."
+    long_about = "Grabs a mouse device and filters bounce events using Asymmetric Eager-Defer.\nCLI flags override config file values."
 )]
 struct Cli {
     #[clap(short, long)]
     device: Option<String>,
 
-    #[clap(short, long, default_value_t = 50)]
-    ms: u64,
+    /// Debounce window in milliseconds. Defaults to 30 if neither CLI nor config sets it.
+    #[clap(short, long)]
+    ms: Option<u64>,
 
     #[clap(short, long)]
     config: Option<PathBuf>,
@@ -111,13 +114,9 @@ fn detect_mouse() -> Option<PathBuf> {
 
 #[derive(Clone, Copy)]
 struct ButtonConfig {
+    debounce_dur: Duration,
     is_debounced: bool,
 }
-
-const EMA_ALPHA: f64 = 0.15;
-const ADAPTIVE_K: f64 = 4.0;
-const ADAPTIVE_MIN_MS: f64 = 5.0;
-const BOOTSTRAP_SAMPLES: u32 = 10;
 
 #[derive(Clone, Copy)]
 struct ButtonState {
@@ -125,71 +124,8 @@ struct ButtonState {
     physical_state: bool,
     press_lockout_until: Option<Instant>,
     release_deadline: Option<Instant>,
-
-    is_active: bool,
-    floor_ms: f64,
-    last_release_at: Option<Instant>,
-    bounce_ema_ms: f64,
-    repress_ema_ms: f64,
-    adaptive_threshold: Duration,
-    sample_count: u32,
-}
-
-impl ButtonState {
-    fn new(bootstrap: Duration) -> Self {
-        let bootstrap_ms = bootstrap.as_millis() as f64;
-        ButtonState {
-            logical_state: false,
-            physical_state: false,
-            press_lockout_until: None,
-            release_deadline: None,
-            last_release_at: None,
-            is_active: false,
-            floor_ms: bootstrap_ms,
-            bounce_ema_ms: bootstrap_ms / ADAPTIVE_K,
-            repress_ema_ms: (bootstrap_ms * 4.0).max(180.0),
-            adaptive_threshold: bootstrap,
-            sample_count: 0,
-        }
-    }
-
-    fn update_adaptive(&mut self, now: Instant, verbose: bool, code: usize) {
-        let Some(last_rel) = self.last_release_at else { return };
-
-        let interval_ms = now.duration_since(last_rel).as_secs_f64() * 1000.0;
-        let t = self.adaptive_threshold.as_secs_f64() * 1000.0;
-
-        let learned = if interval_ms < t {
-            self.bounce_ema_ms = self.bounce_ema_ms * (1.0 - EMA_ALPHA) + interval_ms * EMA_ALPHA;
-            true
-        } else if interval_ms > t * 2.0 {
-            self.repress_ema_ms = self.repress_ema_ms * (1.0 - EMA_ALPHA) + interval_ms * EMA_ALPHA;
-            true
-        } else {
-            false
-        };
-
-        if learned {
-            self.sample_count = self.sample_count.saturating_add(1);
-        }
-
-        if self.sample_count >= BOOTSTRAP_SAMPLES {
-            let new_t = (self.bounce_ema_ms * ADAPTIVE_K)
-                .max(ADAPTIVE_MIN_MS)
-                .min(self.repress_ema_ms / 2.0)
-                .max(self.floor_ms);
-            let new_dur = Duration::from_micros((new_t * 1000.0) as u64);
-            let delta_us = (new_dur.as_micros() as i64 - self.adaptive_threshold.as_micros() as i64).abs();
-            if verbose && delta_us > 3000 {
-                eprintln!(
-                    "Adaptive BTN={code}: threshold {:.1}ms → {:.1}ms \
-                     (bounce_ema={:.1}ms repress_ema={:.1}ms interval={:.1}ms)",
-                    t, new_t, self.bounce_ema_ms, self.repress_ema_ms, interval_ms
-                );
-            }
-            self.adaptive_threshold = new_dur;
-        }
-    }
+    last_event_instant: Option<Instant>,
+    pending_release: bool,
 }
 
 struct RunParams<'a> {
@@ -201,12 +137,20 @@ struct RunParams<'a> {
     verbose: bool,
 }
 
+// TODO: swap InputEvent::new for new_with_time once on evdev ≥ 0.12
+fn now_event(type_: u16, code: u16, value: i32) -> InputEvent {
+    let _d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    InputEvent::new(type_, code, value)
+}
+
 fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
     let mut device = Device::open(p.device_path)
         .map_err(|e| format!("Failed to open {}: {e}", p.device_path.display()))?;
 
     println!(
-        "Opened: {} | Eager-Defer Debounce: {}ms (adaptive) | mode: {}",
+        "Opened: {} | Eager-Defer Debounce: {}ms | mode: {}",
         device.name().unwrap_or("unknown"),
         p.default_debounce.as_millis(),
         if p.debounce_all { "all buttons" } else { "selected buttons only" }
@@ -243,21 +187,32 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
     let table_size = (max_key_code + 1).max(768) as usize;
 
     let mut btn_configs = vec![
-        ButtonConfig { is_debounced: p.debounce_all };
+        ButtonConfig {
+            debounce_dur: p.default_debounce,
+            is_debounced: p.debounce_all,
+        };
         table_size
     ];
-
-    let mut btn_states: Vec<ButtonState> = (0..table_size)
-        .map(|_| ButtonState::new(p.default_debounce))
-        .collect();
+    let mut btn_states = vec![
+        ButtonState {
+            logical_state: false,
+            physical_state: false,
+            press_lockout_until: None,
+            release_deadline: None,
+            last_event_instant: None,
+            pending_release: false,
+        };
+        table_size
+    ];
 
     if let Some(cfg_buttons) = p.cfg_buttons {
         for (code_str, &ms) in cfg_buttons {
             if let Ok(code) = code_str.parse::<u16>() {
                 if (code as usize) < table_size {
-                    let dur = Duration::from_millis(ms);
-                    btn_configs[code as usize] = ButtonConfig { is_debounced: true };
-                    btn_states[code as usize] = ButtonState::new(dur);
+                    btn_configs[code as usize] = ButtonConfig {
+                        debounce_dur: Duration::from_millis(ms),
+                        is_debounced: true,
+                    };
                 }
             }
         }
@@ -265,7 +220,10 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
 
     for &code in p.cli_buttons {
         if (code as usize) < table_size {
-            btn_configs[code as usize] = ButtonConfig { is_debounced: true };
+            btn_configs[code as usize] = ButtonConfig {
+                debounce_dur: p.default_debounce,
+                is_debounced: true,
+            };
         }
     }
 
@@ -289,12 +247,12 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut emit_buffer: Vec<InputEvent> = Vec::with_capacity(64);
-    let mut active_buttons: Vec<usize> = Vec::with_capacity(16);
+    let mut pending_codes: Vec<usize> = Vec::with_capacity(16);
 
     loop {
         let now = Instant::now();
 
-        let next_deadline = active_buttons
+        let next_deadline = pending_codes
             .iter()
             .filter_map(|&code| btn_states[code].release_deadline)
             .min();
@@ -322,14 +280,25 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
                         let value = ev.value();
 
                         if code < table_size && btn_configs[code].is_debounced {
+                            let config = &btn_configs[code];
                             let state = &mut btn_states[code];
+
+                            if let Some(last) = state.last_event_instant {
+                                if now.duration_since(last) < MIN_EVENT_GAP {
+                                    if p.verbose {
+                                        eprintln!(
+                                            "Dropped sub-1ms noise BTN={code} value={value}"
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                            state.last_event_instant = Some(now);
 
                             state.physical_state = value != 0;
 
                             if state.physical_state {
                                 state.release_deadline = None;
-                                state.update_adaptive(now, p.verbose, code);
-                                let threshold = state.adaptive_threshold;
 
                                 let lockout_over = state
                                     .press_lockout_until
@@ -338,22 +307,16 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
 
                                 if !state.logical_state && lockout_over {
                                     state.logical_state = true;
-                                    state.press_lockout_until = Some(now + threshold);
+                                    state.press_lockout_until = Some(now + config.debounce_dur);
                                     emit_buffer.push(ev);
                                 } else if p.verbose && !lockout_over && !state.logical_state {
-                                    eprintln!(
-                                        "Blocked bounce on PRESS BTN={code} \
-                                         (threshold={:.1}ms)",
-                                        threshold.as_secs_f64() * 1000.0
-                                    );
+                                    eprintln!("Blocked bounce on PRESS BTN={code}");
                                 }
                             } else if state.logical_state {
-                                let threshold = state.adaptive_threshold;
-                                state.last_release_at = Some(now);
-                                state.release_deadline = Some(now + threshold);
-                                if !state.is_active {
-                                    state.is_active = true;
-                                    active_buttons.push(code);
+                                state.release_deadline = Some(now + config.debounce_dur);
+                                if !state.pending_release {
+                                    state.pending_release = true;
+                                    pending_codes.push(code);
                                 }
                             }
                         } else {
@@ -371,36 +334,31 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut emitted_deferred = false;
-        active_buttons.retain(|&code| {
+        pending_codes.retain(|&code| {
             let state = &mut btn_states[code];
             if let Some(dl) = state.release_deadline {
                 if now >= dl {
                     if !state.physical_state && state.logical_state {
                         state.logical_state = false;
-                        emit_buffer.push(InputEvent::new(EventType::KEY.0, code as u16, 0));
+                        emit_buffer.push(now_event(EventType::KEY.0, code as u16, 0));
                         emitted_deferred = true;
                         if p.verbose {
-                            eprintln!(
-                                "Emitted deferred RELEASE BTN={code} \
-                                 (threshold={:.1}ms samples={})",
-                                state.adaptive_threshold.as_secs_f64() * 1000.0,
-                                state.sample_count
-                            );
+                            eprintln!("Emitted deferred RELEASE BTN={code}");
                         }
                     }
                     state.release_deadline = None;
-                    state.is_active = false;
+                    state.pending_release = false;
                     return false;
                 }
             } else {
-                state.is_active = false;
+                state.pending_release = false;
                 return false;
             }
             true
         });
 
         if emitted_deferred {
-            emit_buffer.push(InputEvent::new(
+            emit_buffer.push(now_event(
                 EventType::SYNCHRONIZATION.0,
                 evdev::SynchronizationCode::SYN_REPORT.0,
                 0,
@@ -418,8 +376,18 @@ fn main() {
     let config_path = Config::find(cli.config);
     let cfg = Config::load(&config_path);
 
-    let default_ms = cli.ms.max(cfg.ms.unwrap_or(0)).max(1);
-    let debounce_all = cli.buttons.is_empty() && cfg.buttons.is_none();
+    let default_ms = cli.ms.or(cfg.ms).unwrap_or(30).max(1);
+
+    let debounce_all = cli.buttons.is_empty()
+        && cfg.buttons.as_ref().map_or(true, |m| m.is_empty());
+
+    if !debounce_all
+        && cli.buttons.is_empty()
+        && cfg.buttons.as_ref().map_or(false, |m| m.is_empty())
+    {
+        eprintln!("Warning: config specifies an empty [buttons] table — no buttons will be debounced.");
+    }
+
     let default_debounce = Duration::from_millis(default_ms);
     let explicit_device: Option<PathBuf> = cli.device.or(cfg.device).map(PathBuf::from);
 

@@ -1,52 +1,29 @@
 # mouse-debounce
 
-Software mouse button debounce daemon for Linux. Fixes spurious double-clicks caused by worn switches without replacing hardware.
+Software mouse button debounce daemon for Linux (Wayland/X11).
 
-Uses Asymmetric Eager-Defer: press events are emitted immediately (zero added latency), release events are deferred until the debounce window expires. The debounce window adapts per-button at runtime by tracking bounce vs. repress interval distributions, so it stays correct as switches age.
+Tries to fix double-click issues caused by worn switches without replacing hardware.
 
 ## Install
 
 ```bash
 cargo build --release
-sudo cp target/release/mouse-debounce /usr/bin/
+sudo cp target/release/mouse-debounce /usr/local/bin/
 ```
 
-To run on boot, install the included systemd unit:
+## Config
 
-```bash
-sudo cp config/mouse-debounce.service /etc/systemd/system/
-sudo systemctl enable --now mouse-debounce
-```
-
-## Configuration
-
-Copy the example config and edit as needed:
-
-```bash
-mkdir -p ~/.config/mouse-debounce
-cp config/config.example.toml ~/.config/mouse-debounce/config.toml
-```
-
-The device is autodetected if not specified. Default debounce seed is 50ms. System-wide fallback: `/etc/mouse-debounce/config.toml`
+Copy `config/config.example.toml` to `~/.config/mouse-debounce/config.toml` and edit the device path.
 
 ## Usage
 
 ```bash
-# run with autodetect and defaults
+# Use config file
 sudo mouse-debounce
 
-# explicit device and threshold
+# CLI only
 sudo mouse-debounce --device /dev/input/by-id/usb-...-event-mouse --ms 50
 
-# debounce specific buttons only (comma-separated evdev codes)
-sudo mouse-debounce --buttons 272,273
-
-# watch threshold adaptation in real time
+# Tune with verbose output
 sudo mouse-debounce --verbose
 ```
-
-CLI flags override config file values.
-
-## License
-
-MIT
