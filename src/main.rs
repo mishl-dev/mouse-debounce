@@ -48,7 +48,7 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("/root"))
                     .join(".config")
             });
-        let candidates =[
+        let candidates = [
             xdg.join("mouse-debounce/config.toml"),
             PathBuf::from("/etc/mouse-debounce/config.toml"),
         ];
@@ -243,21 +243,16 @@ fn main() {
         }
     });
 
+    let mut emit_buffer: Vec<InputEvent> = Vec::with_capacity(64);
+    let mut active_buttons: Vec<usize> = Vec::with_capacity(16);
+
     loop {
         let now = Instant::now();
-        let mut next_deadline: Option<Instant> = None;
 
-        for state in btn_states.iter() {
-            if let Some(dl) = state.release_deadline {
-                if let Some(nd) = next_deadline {
-                    if dl < nd {
-                        next_deadline = Some(dl);
-                    }
-                } else {
-                    next_deadline = Some(dl);
-                }
-            }
-        }
+        let next_deadline = active_buttons
+            .iter()
+            .filter_map(|&code| btn_states[code].release_deadline)
+            .min();
 
         let timeout = next_deadline.map(|nd| nd.saturating_duration_since(now));
 
@@ -272,7 +267,7 @@ fn main() {
         };
 
         let now = Instant::now();
-        let mut emit_buffer = Vec::with_capacity(64);
+        emit_buffer.clear();
 
         match received {
             Ok(events) => {
@@ -304,6 +299,9 @@ fn main() {
                                 }
                             } else if state.logical_state {
                                 state.release_deadline = Some(now + config.debounce_dur);
+                                if !active_buttons.contains(&code) {
+                                    active_buttons.push(code);
+                                }
                             }
                         } else {
                             emit_buffer.push(ev);
@@ -321,22 +319,26 @@ fn main() {
         }
 
         let mut emitted_deferred = false;
-        for (code, state) in btn_states.iter_mut().enumerate() {
+        active_buttons.retain(|&code| {
+            let state = &mut btn_states[code];
             if let Some(dl) = state.release_deadline {
                 if now >= dl {
                     if !state.physical_state && state.logical_state {
                         state.logical_state = false;
                         emit_buffer.push(InputEvent::new(EventType::KEY.0, code as u16, 0));
                         emitted_deferred = true;
-
                         if cli.verbose {
                             eprintln!("Emitted deferred RELEASE BTN={code}");
                         }
                     }
                     state.release_deadline = None;
+                    return false;
                 }
+            } else {
+                return false;
             }
-        }
+            true
+        });
 
         if emitted_deferred {
             emit_buffer.push(InputEvent::new(
