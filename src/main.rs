@@ -181,6 +181,16 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to set keys: {e}"))?
         .with_relative_axes(&axes)
         .map_err(|e| format!("Failed to set axes: {e}"))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisCode::ABS_X,
+            evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
+        ))
+        .map_err(|e| format!("Failed to set abs x: {e}"))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisCode::ABS_Y,
+            evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
+        ))
+        .map_err(|e| format!("Failed to set abs y: {e}"))?
         .build()
         .map_err(|e| format!("Failed to build virtual device: {e}"))?;
 
