@@ -18,7 +18,7 @@ struct Cli {
     #[clap(short, long)]
     device: Option<String>,
 
-    /// Debounce window in milliseconds. Defaults to 30 if neither CLI nor config sets it.
+    /// Debounce window in milliseconds. Defaults to 40 if neither CLI nor config sets it.
     #[clap(short, long)]
     ms: Option<u64>,
 
@@ -386,7 +386,7 @@ fn main() {
     let config_path = Config::find(cli.config);
     let cfg = Config::load(&config_path);
 
-    let default_ms = cli.ms.or(cfg.ms).unwrap_or(30).max(1);
+    let default_ms = cli.ms.or(cfg.ms).unwrap_or(40).max(1);
 
     let debounce_all = cli.buttons.is_empty()
         && cfg.buttons.as_ref().map_or(true, |m| m.is_empty());
