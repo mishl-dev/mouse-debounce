@@ -7,7 +7,10 @@
 # Device to grab. Leave unset to auto-detect.
 # device = "/dev/input/by-id/usb-Logitech_G102_LIGHTSYNC_Gaming_Mouse_REPLACE_ME-event-mouse"
 
-# Default debounce time in ms for all buttons
+# Default debounce time in ms for all buttons (clamped to 1..1000, default 40).
+# Larger values add release latency and merge fast double-clicks; worn switches
+# rarely need more than 50ms. Keep per-button values uniform if chord release
+# order matters (heterogeneous windows emit in deadline order, not press order).
 ms = 40
 
 # Declare ABS_X/ABS_Y on the virtual device. Compositors classify a device with
@@ -16,12 +19,13 @@ ms = 40
 # source device that needs them. Default: false
 # absolute_axes = false
 
-# Optional: per-button overrides (evdev button codes)
-# 272 = left click
-# 273 = right click
-# 274 = middle click
-# 275 = side button back
-# 276 = side button forward
+# Optional: per-button overrides (evdev button codes, mouse range >= 0x100 only)
+# 272 = left click (BTN_LEFT)
+# 273 = right click (BTN_RIGHT)
+# 274 = middle click (BTN_MIDDLE)
+# 275 = side button back (BTN_SIDE)
+# 276 = extra button (BTN_EXTRA, usually the forward side key)
+# 277 = forward button (BTN_FORWARD, rarely emitted)
 [buttons]
 "272" = 50   # left click — worn switch, needs most debounce
 "273" = 20   # right click — less worn

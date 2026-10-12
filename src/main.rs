@@ -1,12 +1,79 @@
 use evdev::{AttributeSet, Device, EventType, InputEvent, RelativeAxisCode, uinput::VirtualDevice};
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::mpsc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-const MIN_EVENT_GAP: Duration = Duration::from_millis(1);
+const MIN_DEBOUNCE_MS: u64 = 1;
+const MAX_DEBOUNCE_MS: u64 = 1000;
+const DEFAULT_DEBOUNCE_MS: u64 = 40;
+
+fn clamp_debounce_ms(ms: u64) -> u64 {
+    ms.clamp(MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS)
+}
+
+fn debounce_duration(ms: u64) -> Duration {
+    Duration::from_millis(clamp_debounce_ms(ms))
+}
+
+fn deadline_after(now: Instant, dur: Duration) -> Instant {
+    now.checked_add(dur).unwrap_or(now)
+}
+
+fn is_mouse_button(code: u16) -> bool {
+    code >= 0x100
+}
+
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn acquire_singleton() -> std::io::Result<fs::File> {
+    use fs2::FileExt;
+    let uid = unsafe { libc::getuid() };
+    let candidates = [
+        PathBuf::from("/run/mouse-debounce.lock"),
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|d| PathBuf::from(d).join("mouse-debounce.lock"))
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/mouse-debounce-{uid}.lock"))),
+        PathBuf::from(format!("/tmp/mouse-debounce-{uid}.lock")),
+    ];
+    let mut last_err: Option<std::io::Error> = None;
+    for path in &candidates {
+        match fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path) {
+            Ok(f) => match f.try_lock_exclusive() {
+                Ok(()) => {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut f = f;
+                    let _ = f.set_len(0);
+                    let _ = f.seek(SeekFrom::Start(0));
+                    let _ = writeln!(f, "{}", std::process::id());
+                    let _ = f.flush();
+                    return Ok(f);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no lock path")))
+}
 
 #[derive(clap::Parser, Debug)]
 #[clap(
@@ -45,16 +112,39 @@ impl Config {
         if let Some(p) = explicit {
             return p;
         }
-        let xdg = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_next::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/root"))
-                    .join(".config")
-            });
+        let system = PathBuf::from("/etc/mouse-debounce/config.toml");
+        // Root daemon must not trust invoking-user env (sudo -E keeps $HOME/$XDG).
+        // Prefer the admin-owned system config when running as root.
+        if is_root() {
+            if system.exists() {
+                return system;
+            }
+            if let Some(p) = explicit {
+                return p;
+            }
+            eprintln!("Warning: running as root with no system config; falling back to defaults");
+            return system;
+        }
+        let xdg_raw = std::env::var("XDG_CONFIG_HOME").ok();
+        let xdg = match xdg_raw {
+            Some(v) if !v.is_empty() => {
+                let p = PathBuf::from(&v);
+                if p.is_absolute() {
+                    p
+                } else {
+                    eprintln!("Warning: ignoring non-absolute XDG_CONFIG_HOME={v:?}");
+                    dirs_next::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/root"))
+                        .join(".config")
+                }
+            }
+            _ => dirs_next::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/root"))
+                .join(".config"),
+        };
         let candidates = [
             xdg.join("mouse-debounce/config.toml"),
-            PathBuf::from("/etc/mouse-debounce/config.toml"),
+            system,
         ];
         for p in &candidates {
             if p.exists() {
@@ -73,12 +163,21 @@ impl Config {
                     Config::default()
                 })
             }
-            Err(_) => Config::default(),
+            Err(_) => {
+                eprintln!("No config at {}; using defaults", path.display());
+                Config::default()
+            }
         }
     }
 }
 
 fn detect_mouse() -> Option<PathBuf> {
+    fn is_self_named(path: &Path) -> bool {
+        Device::open(path)
+            .ok()
+            .and_then(|d| d.name().map(|n| n == "mouse-debounce"))
+            .unwrap_or(false)
+    }
     let by_id = PathBuf::from("/dev/input/by-id");
     if by_id.exists() {
         if let Ok(entries) = std::fs::read_dir(&by_id) {
@@ -88,8 +187,12 @@ fn detect_mouse() -> Option<PathBuf> {
                 .filter(|p| p.to_string_lossy().contains("event-mouse"))
                 .collect();
             candidates.sort();
-            if let Some(path) = candidates.first() {
-                return Some(path.clone());
+            for path in candidates {
+                if is_self_named(&path) {
+                    eprintln!("Skipping own virtual device in by-id scan: {}", path.display());
+                    continue;
+                }
+                return Some(path);
             }
         }
     }
@@ -102,6 +205,10 @@ fn detect_mouse() -> Option<PathBuf> {
         candidates.sort();
         for path in candidates {
             if let Ok(dev) = Device::open(&path) {
+                if dev.name().map(|n| n == "mouse-debounce").unwrap_or(false) {
+                    eprintln!("Skipping own virtual device: {}", path.display());
+                    continue;
+                }
                 if let Some(keys) = dev.supported_keys() {
                     if keys.contains(evdev::KeyCode::BTN_LEFT) {
                         return Some(path);
@@ -125,7 +232,6 @@ struct ButtonState {
     physical_state: bool,
     press_lockout_until: Option<Instant>,
     release_deadline: Option<Instant>,
-    last_event_instant: Option<Instant>,
     pending_release: bool,
 }
 
@@ -139,11 +245,8 @@ struct RunParams<'a> {
     verbose: bool,
 }
 
-// TODO: swap InputEvent::new for new_with_time once on evdev ≥ 0.12
+// Synthesized events carry zero time; the kernel restamps on uinput emit.
 fn now_event(type_: u16, code: u16, value: i32) -> InputEvent {
-    let _d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
     InputEvent::new(type_, code, value)
 }
 
@@ -205,22 +308,31 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .map_err(|e| format!("Failed to build virtual device: {e}"))?;
 
-    let table_size = (max_key_code + 1).max(768) as usize;
+    let table_size = (max_key_code as usize + 1).max(768);
 
+    // Combo dongles expose keyboard keys on the same node. Debouncing generic
+    // keys swallows repeats and drops fast typing, so debounce_all stays
+    // inside the mouse-button range (>= 0x100). Everything else passes through.
     let mut btn_configs = vec![
         ButtonConfig {
             debounce_dur: p.default_debounce,
-            is_debounced: p.debounce_all,
+            is_debounced: false,
         };
         table_size
     ];
+    if p.debounce_all {
+        btn_configs
+            .iter_mut()
+            .take(table_size.min(0x300))
+            .skip(0x100)
+            .for_each(|c| c.is_debounced = true);
+    }
     let mut btn_states = vec![
         ButtonState {
             logical_state: false,
             physical_state: false,
             press_lockout_until: None,
             release_deadline: None,
-            last_event_instant: None,
             pending_release: false,
         };
         table_size
@@ -230,10 +342,20 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         for (code_str, &ms) in cfg_buttons {
             if let Ok(code) = code_str.parse::<u16>() {
                 if (code as usize) < table_size {
+                    if !is_mouse_button(code) {
+                        eprintln!("Warning: ignoring non-mouse button override {code}");
+                        continue;
+                    }
+                    let clamped = clamp_debounce_ms(ms);
+                    if clamped != ms {
+                        eprintln!("Warning: clamping button {code} {ms}ms to {clamped}ms");
+                    }
                     btn_configs[code as usize] = ButtonConfig {
-                        debounce_dur: Duration::from_millis(ms),
+                        debounce_dur: Duration::from_millis(clamped),
                         is_debounced: true,
                     };
+                } else {
+                    eprintln!("Warning: ignoring out-of-range button override {code}");
                 }
             }
         }
@@ -241,10 +363,28 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
 
     for &code in p.cli_buttons {
         if (code as usize) < table_size {
+            if !is_mouse_button(code) {
+                eprintln!("Warning: ignoring non-mouse button override {code}");
+                continue;
+            }
             btn_configs[code as usize] = ButtonConfig {
                 debounce_dur: p.default_debounce,
                 is_debounced: true,
             };
+        } else {
+            eprintln!("Warning: ignoring out-of-range button override {code}");
+        }
+    }
+
+    if let Some(supported) = device.supported_keys() {
+        let has_keyboard = supported.iter().any(|k| {
+            let c = k.code();
+            (0x1E..=0x35).contains(&c) || c == 0x1C || c == 0x39
+        });
+        if has_keyboard {
+            eprintln!(
+                "Warning: grabbed device exposes keyboard keys; combo dongle suspected. Only mouse buttons (>=0x100) are debounced; point --device at the mouse-only node if typing feels wrong."
+            );
         }
     }
 
@@ -293,6 +433,47 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         emit_buffer.clear();
 
+        // Drain-before-fresh: an already-expired release must hit the wire
+        // before events that arrived in the same tick. Sorted by deadline so
+        // heterogeneous per-button windows emit in deadline order.
+        let mut due: Vec<(Instant, usize)> = pending_codes
+            .iter()
+            .filter_map(|&code| {
+                btn_states[code]
+                    .release_deadline
+                    .map(|dl| (dl, code))
+            })
+            .filter(|(dl, _)| now >= *dl)
+            .collect();
+        due.sort();
+        let mut emitted_deferred = false;
+        for (_, code) in due {
+            let dur = btn_configs[code].debounce_dur;
+            let state = &mut btn_states[code];
+            if !state.physical_state && state.logical_state {
+                state.logical_state = false;
+                emit_buffer.push(now_event(EventType::KEY.0, code as u16, 0));
+                emitted_deferred = true;
+                // Trailing-edge guard: the press lockout anchored at press time
+                // always expired before this release fired, leaving a phantom
+                // window. Re-anchor it here.
+                state.press_lockout_until = Some(deadline_after(now, dur));
+                if p.verbose {
+                    eprintln!("Emitted deferred RELEASE BTN={code}");
+                }
+            }
+            state.release_deadline = None;
+            state.pending_release = false;
+        }
+        pending_codes.retain(|&code| btn_states[code].release_deadline.is_some());
+        if emitted_deferred {
+            emit_buffer.push(now_event(
+                EventType::SYNCHRONIZATION.0,
+                evdev::SynchronizationCode::SYN_REPORT.0,
+                0,
+            ));
+        }
+
         match received {
             Ok(events) => {
                 for ev in events {
@@ -304,21 +485,18 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
                             let config = &btn_configs[code];
                             let state = &mut btn_states[code];
 
-                            if let Some(last) = state.last_event_instant {
-                                if now.duration_since(last) < MIN_EVENT_GAP {
-                                    if p.verbose {
-                                        eprintln!(
-                                            "Dropped sub-1ms noise BTN={code} value={value}"
-                                        );
-                                    }
-                                    continue;
-                                }
-                            }
-                            state.last_event_instant = Some(now);
-
                             state.physical_state = value != 0;
 
                             if state.physical_state {
+                                // Bounded release: chatter while a release is
+                                // pending must not cancel/extend it. Swallow
+                                // the edge and let the expiry guard decide on
+                                // sampled physical state. A genuine re-hold
+                                // (physical==1 at expiry) suppresses the
+                                // release and clears the deadline there.
+                                if state.logical_state && state.release_deadline.is_some() {
+                                    continue;
+                                }
                                 state.release_deadline = None;
 
                                 let lockout_over = state
@@ -328,16 +506,31 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
 
                                 if !state.logical_state && lockout_over {
                                     state.logical_state = true;
-                                    state.press_lockout_until = Some(now + config.debounce_dur);
-                                    emit_buffer.push(ev);
+                                    state.press_lockout_until =
+                                        Some(deadline_after(now, config.debounce_dur));
+                                    if value == 2 {
+                                        emit_buffer.push(now_event(
+                                            EventType::KEY.0,
+                                            code as u16,
+                                            1,
+                                        ));
+                                    } else {
+                                        emit_buffer.push(ev);
+                                    }
                                 } else if p.verbose && !lockout_over && !state.logical_state {
                                     eprintln!("Blocked bounce on PRESS BTN={code}");
                                 }
                             } else if state.logical_state {
-                                state.release_deadline = Some(now + config.debounce_dur);
-                                if !state.pending_release {
-                                    state.pending_release = true;
-                                    pending_codes.push(code);
+                                // First-release-wins: re-arming on every edge
+                                // lets sub-window chatter slide the deadline
+                                // forever. Keep the original deadline.
+                                if state.release_deadline.is_none() {
+                                    state.release_deadline =
+                                        Some(deadline_after(now, config.debounce_dur));
+                                    if !state.pending_release {
+                                        state.pending_release = true;
+                                        pending_codes.push(code);
+                                    }
                                 }
                             }
                         } else {
@@ -350,40 +543,46 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Best-effort release flush: the compositor saw our presses on
+                // this virt node; never leave it stuck down across teardown.
+                let mut flush: Vec<InputEvent> = Vec::new();
+                for (code, state) in btn_states.iter().enumerate() {
+                    if state.logical_state {
+                        flush.push(now_event(EventType::KEY.0, code as u16, 0));
+                    }
+                }
+                if !flush.is_empty() {
+                    flush.push(now_event(
+                        EventType::SYNCHRONIZATION.0,
+                        evdev::SynchronizationCode::SYN_REPORT.0,
+                        0,
+                    ));
+                    let _ = virt.emit(&flush);
+                }
                 return Err("Device disconnected".into());
             }
         }
 
-        let mut emitted_deferred = false;
+        // Reap stale entries left by press-cancel races (deadline None) so the
+        // next min() computation never sees them.
         pending_codes.retain(|&code| {
-            let state = &mut btn_states[code];
-            if let Some(dl) = state.release_deadline {
-                if now >= dl {
-                    if !state.physical_state && state.logical_state {
-                        state.logical_state = false;
-                        emit_buffer.push(now_event(EventType::KEY.0, code as u16, 0));
-                        emitted_deferred = true;
-                        if p.verbose {
-                            eprintln!("Emitted deferred RELEASE BTN={code}");
-                        }
-                    }
-                    state.release_deadline = None;
-                    state.pending_release = false;
-                    return false;
-                }
+            if btn_states[code].release_deadline.is_none() {
+                btn_states[code].pending_release = false;
+                false
             } else {
-                state.pending_release = false;
-                return false;
+                true
             }
-            true
         });
 
-        if emitted_deferred {
-            emit_buffer.push(now_event(
-                EventType::SYNCHRONIZATION.0,
-                evdev::SynchronizationCode::SYN_REPORT.0,
-                0,
-            ));
+        // Swallowed bounces still forward their frame SYN; drop SYN-only noise
+        // so fully-suppressed clicks emit nothing.
+        if !emitted_deferred
+            && !emit_buffer.is_empty()
+            && emit_buffer
+                .iter()
+                .all(|e| e.event_type() == EventType::SYNCHRONIZATION)
+        {
+            emit_buffer.clear();
         }
 
         if !emit_buffer.is_empty() {
@@ -394,10 +593,18 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
+    let _singleton = acquire_singleton().unwrap_or_else(|e| {
+        eprintln!("mouse-debounce is already running ({e}); exiting");
+        std::process::exit(2);
+    });
     let config_path = Config::find(cli.config);
     let cfg = Config::load(&config_path);
 
-    let default_ms = cli.ms.or(cfg.ms).unwrap_or(40).max(1);
+    let raw_ms = cli.ms.or(cfg.ms).unwrap_or(DEFAULT_DEBOUNCE_MS);
+    let default_ms = clamp_debounce_ms(raw_ms);
+    if default_ms != raw_ms {
+        eprintln!("Warning: clamping debounce {raw_ms}ms to {default_ms}ms (max {MAX_DEBOUNCE_MS}ms)");
+    }
 
     let debounce_all = cli.buttons.is_empty()
         && cfg.buttons.as_ref().map_or(true, |m| m.is_empty());
@@ -409,7 +616,7 @@ fn main() {
         eprintln!("Warning: config specifies an empty [buttons] table — no buttons will be debounced.");
     }
 
-    let default_debounce = Duration::from_millis(default_ms);
+    let default_debounce = debounce_duration(default_ms);
     let explicit_device: Option<PathBuf> = cli.device.or(cfg.device).map(PathBuf::from);
 
     const RETRY_DELAY: Duration = Duration::from_millis(500);
