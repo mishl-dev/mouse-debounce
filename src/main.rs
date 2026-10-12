@@ -37,6 +37,7 @@ struct Config {
     device: Option<String>,
     ms: Option<u64>,
     buttons: Option<HashMap<String, u64>>,
+    absolute_axes: Option<bool>,
 }
 
 impl Config {
@@ -134,6 +135,7 @@ struct RunParams<'a> {
     default_debounce: Duration,
     cli_buttons: &'a [u16],
     cfg_buttons: &'a Option<HashMap<String, u64>>,
+    absolute_axes: bool,
     verbose: bool,
 }
 
@@ -174,23 +176,32 @@ fn run(p: &RunParams) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut virt = VirtualDevice::builder()
+    let mut builder = VirtualDevice::builder()
         .map_err(|e| format!("Failed to create virtual device builder: {e}"))?
         .name("mouse-debounce")
         .with_keys(&keys)
         .map_err(|e| format!("Failed to set keys: {e}"))?
         .with_relative_axes(&axes)
-        .map_err(|e| format!("Failed to set axes: {e}"))?
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
-            evdev::AbsoluteAxisCode::ABS_X,
-            evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
-        ))
-        .map_err(|e| format!("Failed to set abs x: {e}"))?
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
-            evdev::AbsoluteAxisCode::ABS_Y,
-            evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
-        ))
-        .map_err(|e| format!("Failed to set abs y: {e}"))?
+        .map_err(|e| format!("Failed to set axes: {e}"))?;
+
+    // Absolute axes make libinput classify the proxy as a touch-class device,
+    // which lets the compositor's touchpad config (e.g. natural_scroll) leak
+    // onto an ordinary mouse. Off unless a tablet-like source device needs it.
+    if p.absolute_axes {
+        builder = builder
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                evdev::AbsoluteAxisCode::ABS_X,
+                evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
+            ))
+            .map_err(|e| format!("Failed to set abs x: {e}"))?
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                evdev::AbsoluteAxisCode::ABS_Y,
+                evdev::AbsInfo::new(0, 0, 65535, 0, 0, 1),
+            ))
+            .map_err(|e| format!("Failed to set abs y: {e}"))?;
+    }
+
+    let mut virt = builder
         .build()
         .map_err(|e| format!("Failed to build virtual device: {e}"))?;
 
@@ -425,6 +436,7 @@ fn main() {
             default_debounce,
             cli_buttons: &cli.buttons,
             cfg_buttons: &cfg.buttons,
+            absolute_axes: cfg.absolute_axes.unwrap_or(false),
             verbose: cli.verbose,
         };
 

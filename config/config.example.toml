@@ -10,6 +10,12 @@
 # Default debounce time in ms for all buttons
 ms = 40
 
+# Declare ABS_X/ABS_Y on the virtual device. Compositors classify a device with
+# absolute axes as touch-class, which can make touchpad settings (e.g.
+# natural_scroll) apply to an ordinary mouse. Only enable for a tablet-like
+# source device that needs them. Default: false
+# absolute_axes = false
+
 # Optional: per-button overrides (evdev button codes)
 # 272 = left click
 # 273 = right click
