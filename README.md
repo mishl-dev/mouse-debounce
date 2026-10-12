@@ -1,8 +1,11 @@
 # mouse-debounce
 
-Software mouse button debounce daemon for Linux (Wayland/X11).
+Got a mouse that double-clicks when you single-click? That's a worn switch
+bouncing inside. This tool sits between your mouse and your computer and
+filters out those fake extra clicks, so you don't have to buy a new mouse (or
+open it up to replace the switch).
 
-Tries to fix double-click issues caused by worn switches without replacing hardware.
+Works on Linux, both Wayland and X11.
 
 ## Install
 
@@ -11,25 +14,47 @@ cargo build --release
 sudo cp target/release/mouse-debounce /usr/local/bin/
 ```
 
-## Config
+## Setup
 
-Copy `config/config.example.toml` to `~/.config/mouse-debounce/config.toml` and edit the device path.
-The service reads `/etc/mouse-debounce/config.toml`. When running as root
-(service or sudo) without `--config`, the system path wins — root never trusts
-the invoking user's `$HOME`/`$XDG_CONFIG_HOME`. For manual root runs prefer:
-`sudo -H mouse-debounce --config /etc/mouse-debounce/config.toml`.
+1. Copy the example config and pick your mouse:
+   ```bash
+   mkdir -p ~/.config/mouse-debounce
+   cp config/config.example.toml ~/.config/mouse-debounce/config.toml
+   ```
+   Find your mouse in `/dev/input/by-id/` (look for the `event-mouse` one) and
+   put that path in the `device` line.
+2. Run it with sudo (it needs permission to read your mouse):
+   ```bash
+   sudo mouse-debounce
+   ```
+   The service version reads `/etc/mouse-debounce/config.toml` instead. When
+   running as root, always point at the system config explicitly:
+   `sudo -H mouse-debounce --config /etc/mouse-debounce/config.toml`.
 
-## How it works (Asymmetric Eager-Defer)
+## Tuning
 
-Press is eager (emitted immediately plus a lockout window); release is deferred
-by the debounce window and cancelled by a re-press. Consequences: every release
-costs `ms` of up-latency, clicks separated by less than `ms` across a release
-merge into one hold, and holds are safe (re-press cancels the pending release).
-Releases already due always emit before newly arrived events in the same tick.
-Only mouse buttons (`>= 0x100`) are debounced; keyboard keys on combo dongles
-pass through. Prefer the mouse-only `/dev/input/by-id/*event-mouse` node for
-combo receivers. Middle-click paste (`L+R`) and drags work: presses are never
-delayed, releases stretch by at most one window.
+One number matters: `ms` — how long to ignore bounces after a click.
+Bigger = fewer double-clicks, but releasing the button feels slightly later.
+Start at 40. Worn-out left click? Give it more (like 55), leave the rest low:
+
+```toml
+ms = 35
+[buttons]
+"272" = 55   # left click — the worn one
+"273" = 20   # right click
+"274" = 10   # middle click
+```
+
+(272 = left, 273 = right, 274 = middle, 275/276 = side buttons.)
+
+Things to know:
+- Clicking still feels instant. Only the *release* is delayed by `ms`, so
+  super-fast double-clicks (faster than your `ms`) can merge into one — lower
+  `ms` if that happens.
+- Holding the button to drag is safe — shaky switches won't drop the drag.
+- Only mouse buttons are filtered. If your receiver also handles a keyboard
+  (combo dongle), typing passes through untouched — but use the mouse-only
+  `event-mouse` device if you can.
 
 ## Usage
 
@@ -37,9 +62,9 @@ delayed, releases stretch by at most one window.
 # Use config file
 sudo mouse-debounce
 
-# CLI only
+# Just try it on one mouse without a config
 sudo mouse-debounce --device /dev/input/by-id/usb-...-event-mouse --ms 50
 
-# Tune with verbose output
+# See what it's filtering
 sudo mouse-debounce --verbose
 ```
